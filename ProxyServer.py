@@ -1,5 +1,5 @@
 import socket
-import sys, os
+import os
 import _thread as thread
 import datetime, time
 
@@ -8,15 +8,15 @@ MAX_CONNECTIONS = 10
 BUFFER_SIZE = 4096
 CACHE_DIRECTORY = "cache"
 CONFIG_FILE = "config.conf"
-image_extensions = [    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.webp', 
-                        '.raw', '.heic', '.pdf', '.ai', '.ico', '.tif', '.psd'     ]
-cache = {}  # Dictionary to store the cached images and their expiration times         
-
-#-------------------------  SUPPORTER FUNCTIONS  -------------------------#
 
 # Generate folder "cache" whether not exist
 if not os.path.exists(CACHE_DIRECTORY):
     os.makedirs(CACHE_DIRECTORY)
+
+time_caching_images_file = os.path.join(CACHE_DIRECTORY, 'time_caching_images.txt')
+if not os.path.exists(time_caching_images_file):
+    with open(time_caching_images_file, 'a+') as f:
+        pass
 
 # Read config file
 def read_config(filename):
@@ -74,18 +74,7 @@ def is_allowed_time(time_restriction):
         return False
 
 # Check whether website is in whitelisting
-def is_whitelisting(url):
-    # Delete 'http://'
-    if url.startswith("http://"):
-        url = url[len("http://"):]
-
-    # Find index of the first '/' after domain
-    slash_index = url.find("/")
-    if slash_index != -1:
-        domain = url[:slash_index]
-    else:
-        domain = url
-
+def is_whitelisting(domain):
     for allowed_domain in whitelisting:
         if domain in allowed_domain:
             return True
@@ -153,84 +142,81 @@ def parse_request(client_data):
         "method": first_line_tokens[0],
     }
 
-#-------------------------  HANDLE CACHE IMAGE  -------------------------#
-    
-def load_image(image_path):
-    with open(image_path, "rb") as image_file:
-        image_data = image_file.read()
-    return image_data
+def timing_caching_image(image_url):
+    with open(time_caching_images_file, 'r') as file:
+        lines = file.readlines()
 
-def is_cache_expired(cache_key, cache_time):
-    if cache_key in cache:
-        cached_time, _, _ = cache[cache_key]
-        current_time = time.time()
-        return current_time - cached_time > cache_time
-    return True
+    with open(time_caching_images_file, 'w') as file:
+        for line in lines:
+            if image_url in line:
+                # Update the cached time in the line
+                current_time = time.time()
+                updated_line = f"{image_url} {current_time}\n"
+                file.write(updated_line)
+            else:
+                file.write(line)
 
-def get_cached_response(url, webserver, filename):
-    # Your implementation to check cache expiration here
-    cache_expired = is_cache_expired((webserver, filename), cache_expiration_time)
-    
-    if not cache_expired:
-        image_path = os.path.join(CACHE_DIRECTORY, webserver, filename)
-        file_extension = filename.split('.')[-1]
-        content_type = f"Content-Type: image/{file_extension}"
-        with open(image_path, 'rb') as f:
-            image_data = f.read()
-        return content_type, image_data
+def get_cached_response(image_url):
+    # Find domain and path
+    domain = image_url.split('/')[0]
+    path = '/' + '/'.join(image_url.split('/')[1:])
 
-    return None, None
+    # Implementation to check cache expiration
+    current_time = time.time()
+    cached_time = None
+    with open(time_caching_images_file, 'r') as file:
+        for line in file:
+            if image_url in line:
+                cached_time = float(line.split(' ')[1])
+                break
 
-def save_cache_image(request, response, cache_time):
+    if cached_time is not None and current_time - cached_time <= cache_expiration_time:
+        image_path = os.path.join(CACHE_DIRECTORY, domain, path)
+        file_extension = path.split('.')[-1]
+        content_type = f"image/{file_extension}"
+
+        try:
+            with open(image_path, 'rb') as f:
+                image_data = f.read()
+            return content_type, image_data
+        except FileNotFoundError:
+            print("Image file not found:", image_path)
+            return None
+        except Exception as e:
+            print("Error reading image file:", e)
+            return None
+    else:
+        return None
+
+def save_cache_image(request, response):
     parsed_request = parse_request(request)
     total_url = parsed_request["total_url"]
 
     domain = total_url.split('/')[0]
     path = '/' + '/'.join(total_url.split('/')[1:])
 
-    extension = '.' + path.split('.')[-1] if '.' in path else ""
-
-    if extension not in image_extensions:
-        return False, b""
-    
-    # Create cache folder if it doesn't exist
-    image_folder = os.path.join(CACHE_DIRECTORY, domain)
-    if not os.path.exists(image_folder):
-        os.makedirs(image_folder)
-    
-    # Create image subfolder if it doesn't exist
-    if not os.path.exists(image_folder):
-        os.makedirs(image_folder)
-    
-    image_path = os.path.join(image_folder, f"{os.path.basename(path).rsplit('.', 1)[0]}.{extension}")
     headers, image_data = response.split(b'\r\n\r\n', 1)
-    # print(f"Headers: {headers}")
-    # print(f"Image data: {image_data}")
 
-    # Save the binary image data
-    with open(image_path, "wb") as image_file:
-        image_file.write(image_data)
+    if b"Content-Type: image/" in headers:
+        extension = '.' + path.split('.')[-1] if '.' in path else ""
 
-    # Save caching time to a text file
-    cache_time_file = os.path.join(image_folder, f"{os.path.basename(path).rsplit('.', 1)[0]}.txt")
-    with open(cache_time_file, "w") as time_file:
-        time_file.write(str(time.time()))
+    
+        # Create cache folder if it doesn't exist
+        image_folder = os.path.join(CACHE_DIRECTORY, domain)
+        if not os.path.exists(image_folder):
+            os.makedirs(image_folder)
+        
+        image_path = os.path.join(image_folder, f"{os.path.basename(path).rsplit('.', 1)[0]}{extension}")
+    
+        # print(f"Headers: {headers}")
+        # print(f"Image data: {image_data}")
 
-# def store_image_in_cache(url, image_data, webserver):
-#     web_server_folder = os.path.join(CACHE_DIRECTORY, webserver)
-#     if not os.path.exists(web_server_folder):
-#         os.makedirs(web_server_folder)
+        # Save the binary image data
+        with open(image_path, "wb") as image_file:
+            image_file.write(image_data)
 
-#     filename = os.path.basename(url)
-#     image_path = os.path.join(web_server_folder, filename)
-#     with open(image_path, 'wb') as f:
-#         f.write(image_data)
-
-#     cache_time_file = os.path.join(web_server_folder, f"{filename.rsplit('.', 1)[0]}.txt")
-#     with open(cache_time_file, "w") as time_file:
-#         time_file.write(str(time.time()))
-
-# -----------------------------  PROXY SERVER  -----------------------------#
+        # Save caching time to "time_caching_images_file"
+        timing_caching_image(total_url)
 
 def handle_request(request):
     # Parse the request to get the method and total_url
@@ -242,9 +228,13 @@ def handle_request(request):
     domain = total_url.split('/')[0]
     path = '/' + '/'.join(total_url.split('/')[1:])
 
-    content_type, image_data = get_cached_response(total_url, domain, path)
+    cached_response = get_cached_response(total_url)
+    if cached_response is not None:
+        content_type, image_data = cached_response
+    else:
+        content_type, image_data = None, None
     
-    if content_type and image_data:
+    if content_type is not None and image_data is not None:
         return image_data
 
     # Build the appropriate request for the web server
@@ -280,8 +270,7 @@ def handle_request(request):
 
     # Check if the response contains image data
     if "Content-Type: image/" in data.decode("ISO-8859-1"):
-        save_cache_image(request, data, cache_expiration_time)
-        # store_image_in_cache(total_url, data, domain)
+        save_cache_image(request, data)
 
     webSerSock.close()
     return data
@@ -298,7 +287,8 @@ def handle_client(tcpCliSock):
     parsed_request = parse_request(request)
     method = parsed_request["method"]
     total_url = parsed_request["total_url"]
-        
+    domain = parsed_request["domain"]
+
     # Check if the method is allowed
     if method not in ["GET", "POST", "HEAD"]:
         print("\n\nError: Do not support other methods, apart from: GET, POST, HEAD")
@@ -310,16 +300,18 @@ def handle_client(tcpCliSock):
     print(request, end='')
         
     # Check if the URL is in whitelisting
-    # if not is_whitelisting(domain, whitelisting):
-    #     print("Error: Not in whitelist")
-    #     serve_403_response(tcpCliSock)``
-    #     return
+    if enable_whitelisting == True:
+        if not is_whitelisting(domain):
+            print("Error: Not in whitelist")
+            serve_403_response(tcpCliSock)
+            return
         
     # Check if the time is in allowed time
-    if not is_allowed_time(time_restriction):
-        print ("Error: Time restriction")
-        serve_403_response(tcpCliSock)
-        return 
+    if enable_time_restriction == True: 
+        if not is_allowed_time(time_restriction):
+            print ("Error: Time restriction")
+            serve_403_response(tcpCliSock)
+            return 
     
     # Handle request
     if method in ["GET", "POST", "HEAD"]:
