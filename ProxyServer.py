@@ -3,9 +3,6 @@ import os
 import _thread as thread
 import datetime, time
 
-# global variables
-MAX_CONNECTIONS = 10
-BUFFER_SIZE = 4096
 CACHE_DIRECTORY = "cache"
 CONFIG_FILE = "config.conf"
 
@@ -143,24 +140,33 @@ def parse_request(client_data):
     }
 
 def timing_caching_image(image_url):
+    flag = False
     with open(time_caching_images_file, 'r') as file:
         lines = file.readlines()
 
     with open(time_caching_images_file, 'w') as file:
         for line in lines:
             if image_url in line:
+                print("Update time caching image successfully!")
                 # Update the cached time in the line
                 current_time = time.time()
                 updated_line = f"{image_url} {current_time}\n"
                 file.write(updated_line)
+                flag = True
             else:
                 file.write(line)
 
+        if flag == False:
+            print("Save time caching image successfully!")
+            current_time = time.time()
+            new_line = f"{image_url} {current_time}\n"
+            file.write(new_line)
+    
 def get_cached_response(image_url):
     # Find domain and path
     domain = image_url.split('/')[0]
-    path = '/' + '/'.join(image_url.split('/')[1:])
-
+    filename = image_url.split('/')[-1]
+    
     # Implementation to check cache expiration
     current_time = time.time()
     cached_time = None
@@ -171,8 +177,9 @@ def get_cached_response(image_url):
                 break
 
     if cached_time is not None and current_time - cached_time <= cache_expiration_time:
-        image_path = os.path.join(CACHE_DIRECTORY, domain, path)
-        file_extension = path.split('.')[-1]
+        image_path = os.path.join(CACHE_DIRECTORY, domain, filename)
+        file_extension = filename.split('.')[-1]
+
         content_type = f"image/{file_extension}"
 
         try:
@@ -214,6 +221,7 @@ def save_cache_image(request, response):
         # Save the binary image data
         with open(image_path, "wb") as image_file:
             image_file.write(image_data)
+            print("Save cached image successfully!")
 
         # Save caching time to "time_caching_images_file"
         timing_caching_image(total_url)
@@ -233,8 +241,9 @@ def handle_request(request):
         content_type, image_data = cached_response
     else:
         content_type, image_data = None, None
-    
+
     if content_type is not None and image_data is not None:
+        print("Get cached image successfully!")
         return image_data
 
     # Build the appropriate request for the web server
@@ -253,30 +262,65 @@ def handle_request(request):
             request_to_send += request.partition("\r\n\r\n")[2]
 
     if method == "HEAD":
-        request_to_send = f"HEAD {path} HTTP/1.0\r\nHost: {domain}\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
+        request_to_send = f"HEAD {path} HTTP/1.0\r\nHost: {domain}\r\nConnection: close\r\n\r\n"
 
     # Connect to web server and get reply
     webSerSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     webSerSock.connect((domain, 80))
     webSerSock.send(request_to_send.encode("ISO-8859-1"))
 
-    # Receive reply from web server
-    data = b""
+    # Receive response from web server
+    response = b""
     while True:
-        chunk = webSerSock.recv(BUFFER_SIZE)
+        chunk = webSerSock.recv(buffer_size)
         if not chunk:
             break
-        data += chunk
+        response += chunk
+    
+    response_str = response.decode("ISO-8859-1")
 
+    # Handle "Transfer-Encoding: chunked" if exist in response headers
+    if "Transfer-Encoding: chunked" in response_str:
+        # Split the response into chunks
+        chunks = response_str.split("\r\n")
+        
+        # Process each chunk separately
+        decoded_chunks = []
+        for chunk in chunks:
+            if len(chunk) > 0 and chunk[0] != '\r':
+                decoded_chunks.append(chunk)
+                
+        # Reconstruct the response from the decoded chunks
+        response_str = "\r\n".join(decoded_chunks)
+    
+    # Handle "Content-Length" if exist in response headers
+    elif "Content-Length:" in response_str:
+        # Find the value of the Content-Length header
+        content_length_index = response_str.find("Content-Length:")
+        content_length_value_index = content_length_index + len("Content-Length:")
+        content_length_end_index = response_str.find("\r", content_length_value_index)
+        
+        content_length_str = response_str[content_length_value_index:content_length_end_index].strip()
+        
+        # Convert the Content-Length value to an integer
+        content_length = int(content_length_str)
+        
+        # Truncate the response to the specified Content-Length
+        body_start_index = response_str.find("\r\n\r\n") + len("\r\n\r\n")
+        
+        if len(response_str) >= body_start_index + content_length:
+            response_str = response_str[:body_start_index + content_length]
+    
     # Check if the response contains image data
-    if "Content-Type: image/" in data.decode("ISO-8859-1"):
-        save_cache_image(request, data)
-
+    if "Content-Type: image/" in response.decode("ISO-8859-1"):
+        save_cache_image(request, response)
+    
     webSerSock.close()
-    return data
+    
+    return response_str.encode("ISO-8859-1")
 
 def handle_client(tcpCliSock):
-    request = tcpCliSock.recv(BUFFER_SIZE).decode("ISO-8859-1")
+    request = tcpCliSock.recv(buffer_size).decode("ISO-8859-1")
         
     if not request:
         print("Error: Invalid request")
@@ -293,6 +337,7 @@ def handle_client(tcpCliSock):
     if method not in ["GET", "POST", "HEAD"]:
         print("\n\nError: Do not support other methods, apart from: GET, POST, HEAD")
         serve_403_response(tcpCliSock)
+        tcpCliSock.close()
         return
 
     print(f"\n\n[+] Accepted connection from {tcpCliSock.getpeername()[0]}:{tcpCliSock.getpeername()[1]}")
@@ -304,6 +349,7 @@ def handle_client(tcpCliSock):
         if not is_whitelisting(domain):
             print("Error: Not in whitelist")
             serve_403_response(tcpCliSock)
+            tcpCliSock.close()
             return
         
     # Check if the time is in allowed time
@@ -311,6 +357,7 @@ def handle_client(tcpCliSock):
         if not is_allowed_time(time_restriction):
             print ("Error: Time restriction")
             serve_403_response(tcpCliSock)
+            tcpCliSock.close()
             return 
     
     # Handle request
@@ -319,7 +366,6 @@ def handle_client(tcpCliSock):
 
     # Reply to client
     tcpCliSock.sendall(response)
-    print(tcpCliSock, "closed")
     tcpCliSock.close()
 
 def main():
